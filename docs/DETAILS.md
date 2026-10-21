@@ -187,7 +187,8 @@ other ~18 GB), a 32 GB PC with a 12-16 GB GPU the Coder; IQ3_XXS on a 32 GB PC s
   generated tokens / total decode time; the two release arms are within 0.2%. Short/long new-input requests gain
   16.3%/16.9%; total prompt speed differs by 2.5%, within run variation. Decode file-tier demand reads per generated
   token fall from 14.15 -> 2.67; 8,056 successful RAM promotions read another blob each, giving 3.16 with those added.
-  These are file-tier counts, not physical SSD I/O. RAM residency does not exempt an expert from tail skip. One machine,
+  These are file-tier counts, not physical SSD I/O. RAM residency does not exempt an expert from tail skip (that run had no helper GPU; with a helper the
+  skip narrows to file-tier misses - see the tail skip section). One machine,
   one quantization; tail skip off, blocking adaptation, `--spec 2` and the soak were not repeated on v0.1.43.
 - `--adapt-async 1` (opt-in, `--serve`): the swaps of a round advance between decode windows on a helper thread
   (copy back, copy in, move into RAM) instead of one window waiting for the whole round. With `--batch` slots it
@@ -1874,9 +1875,12 @@ tokens identical to 0.1.42 without the change, on the RTX 3060, the RTX A4000 al
 `STRATA_ROUTE_TAIL_SKIP=7 is ON (default)` names the opt-out.
 Since 0.1.43 the same default holds on HIP for gfx1200 / gfx1201 (RDNA4), under the same rules and with the same `STRATA_ROUTE_TAIL_SKIP=0` opt-out; other AMD parts are unchanged.
 
-Where it applies: serve on a CUDA build with one GPU or a layer split (every stage skips by itself). Not applied, and no line printed: when every expert is
+Where it applies: serve on a CUDA build with one GPU or a layer split (every stage skips by itself), including while a helper GPU is attached.
+With no helper, a missed tail is skipped even when its bytes are already in RAM. With a helper, a file-tier miss is skipped; an expert the helper
+holds, or one already in the host copy (a resident file, or the anonymous arena, not an mmap), is still computed. The helper's start-up line says
+that, and it does not repeat the +10..20% figure. Not applied, and no line printed: when every expert is
 in VRAM (nothing is missed), with `--batch` / `parallel` slots (a window then mixes requests, and one request's skip would depend on another's
-tokens: kept off until measured), with a peer-expert tier or a helper GPU, on HIP and SYCL builds, and (0.1.42.1, #1884) when 90% or more
+tokens: kept off until measured), with a peer-expert tier, on HIP and SYCL builds, and (0.1.42.1, #1884) when 90% or more
 of all the experts are in the GPU cache: the few misses are cheap there and the skip costs more draft acceptance than it saves (a Tesla V100 32 GB
 with Coder IQ1_M, 94.8% of the experts cached, 99.9% decode hits: draft acceptance 70.1% to 68.2%, decode 1-2% slower than 0.1.41). A start-up line
 says so; `STRATA_ROUTE_TAIL_SKIP=7` turns it on anyway, and `STRATA_TAIL_SKIP_MAX_CACHED=<percent>` moves the line (101 = never). On an AMD layer split the line is 60% (2x R9700 at 16 GB-equivalent: Q2_0 with 73% cached lost 6.1% story decode with the skip, IQ3_S with 45% cached gained 7-10%). The request log gets
