@@ -111,7 +111,8 @@ each extra card of a split costs an estimated 2 GB of its own buffers.
   own prompt buffers) - unless you name it with `--gpus`: then setup says the risk and asks (`--yes` with the named
   cards goes ahead);
 - Intel GPUs, and a mix of NVIDIA and AMD cards. (AMD cards share a model among themselves: `./setup.sh --backend
-  hip --gpus 1,0`, see [AMD_HIP.md](AMD_HIP.md).)
+  hip --gpus 1,0`, see [AMD_HIP.md](AMD_HIP.md). The exception is the opt-in hybrid source build: it runs an NVIDIA
+  primary and AMD cards - as expert-cache helpers - in one engine process, see [AMD_HIP.md](AMD_HIP.md).)
 
 Or edit an existing config (`strata-*.json`), then restart:
 
