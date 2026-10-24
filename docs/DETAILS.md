@@ -1397,7 +1397,8 @@ every line: a malformed or unknown one, counts that are negative or go back, an 
 that is not a finite number end the engine as out of step.
 
 One file holds the running state, the deepest checkpoint, every QSA layer's K/V up to the conversation's length and
-the draft layer's K/V. Under `--layer-split` it holds the same for every stage: each stage's running state comes as
+the drafter's K/V when the engine has one (an engine without `--mtp` keeps no draft group). Under `--layer-split` it
+holds the same for every stage: each stage's running state comes as
 per-stage parts of the live state and of every checkpoint, and the K/V layers come as stage-ordered groups (a stage's
 group ends with the draft layer's source exactly where that stage owns the drafter). Format v2, little-endian,
 fixed-width integers, IEEE-754 floats (a big-endian build does not compile): a 64-byte header (magic `STRSESS\x01`,
@@ -1472,7 +1473,7 @@ more than 16 MiB apart. A symbolic link, a second hard link and a file with one 
 `--rope-freq-base` refused the file and then answered; a save with a RAM floor above the machine's RAM was refused as
 `memory` before any copy, the file it would have replaced untouched. The times are single runs.
 
-**Current limits (v1):** one request at a time unless `"parallel": N` is set (opt-in batch slots, up to N requests
+**Current limits:** one request at a time unless `"parallel": N` is set (opt-in batch slots, up to N requests
 decoded together: [BATCHING.md](BATCHING.md)), and one conversation cached at a time (switching between two chats
 re-reads the other one unless the opt-in cache above is enabled, or each conversation keeps its own batch slot); images only when set up with them (below); no video. **Temperature / top_p / top_k / min_p /
 seed** are honored per request (OpenAI and Anthropic fields), and so are stop strings (OpenAI `stop`, a string or up
