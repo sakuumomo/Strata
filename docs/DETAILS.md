@@ -1368,7 +1368,11 @@ pressure still returns the last refusal. The wait is outside the engine's report
 This can trade later prefix-cache hits for room to save. Released caches stay released even if admission or file
 I/O later fails; the current tokens, images, steering and live device state are unchanged. It cannot guarantee a
 SAVE under arbitrary memory pressure. With the option off, or enough RAM at the first probe, cache retention and
-the session file format are unchanged. RESTORE is unchanged.
+the session file format are unchanged. RESTORE uses the same opt-in: when the RAM check that precedes parsing
+refuses, the same ladder first frees the reconstructible host caches (retained K/V reuse, the oldest unpinned parked
+conversations, the checkpoint chain from the back - never the live device state), logs `restore reclaimed ...` and
+asks RAM again; if the ladder runs dry the typed `memory` refusal stands and the engine keeps serving. The
+checkpoint a restore would resume from - the deepest one and every pin - survives the ladder either way.
 
 The request must be `Content-Type: application/json` (else `415`) and come from no browser page, Strata's own or a
 trusted origin (another site's `Origin` gets `403`, also with an API key); the Host and API-key checks apply as
@@ -1396,13 +1400,23 @@ every line: a malformed or unknown one, counts that are negative or go back, an 
 that is not a finite number end the engine as out of step.
 
 One file holds the running state, the deepest checkpoint, every QSA layer's K/V up to the conversation's length and
-the draft layer's K/V. Format v1, little-endian, fixed-width integers, IEEE-754 floats (a big-endian build does not
-compile): a 64-byte header (magic `STRSESS\x01`, version u32, header size u32, model fingerprint u64, config
-fingerprint u64, payload length u64, two reserved u64 that must be 0, a hash of the first 56 bytes), the payload
-(geometry, layer range, cvec flag, the live state, the checkpoints, the K/V layers; every array preceded by its u64
-count), the payload hash and the end marker `STRSEND\x01`. The hash is a 64-bit function with xxHash64-style rounds,
+the drafter's K/V when the engine has one (an engine without `--mtp` keeps no draft group). Under `--layer-split` it
+holds the same for every stage: each stage's running state comes as
+per-stage parts of the live state and of every checkpoint, and the K/V layers come as stage-ordered groups (a stage's
+group ends with the draft layer's source exactly where that stage owns the drafter). Format v2, little-endian,
+fixed-width integers, IEEE-754 floats (a big-endian build does not compile): a 64-byte header (magic `STRSESS\x01`,
+version u32 = 2, header size u32, model fingerprint u64, config fingerprint u64, payload length u64, two reserved u64
+that must be 0, a hash of the first 56 bytes), the payload (geometry, layer range, cvec flag, the stage table - one
+entry per later stage: its own layer range, its session carve's QSA and GDN sizes, and whether its K/V group ends
+with the draft layer; an empty table on a runtime without a split - the live state and its stage parts, the
+checkpoints and their stage parts, the K/V groups; every array preceded by its u64 count), the payload hash and the
+end marker `STRSEND\x01`. The hash is a 64-bit function with xxHash64-style rounds,
 not the standard XXH64 stream; it detects accidental corruption and does not authenticate a file: restore only files
-this engine wrote. An unknown version is refused; a new format gets a new version number.
+this engine wrote. An unknown version is refused; a new format gets a new version number. Format v1 (the predecessor
+without the stage table, written before split sessions existed) is refused with `unsupported version 1` before its RAM
+admission is even asked; an old file is replaced by saving again. The split adds only its structure to the bytes:
+measured +24 bytes on a 18,966-token conversation that saves one checkpoint (a runtime without a split writes an
+empty stage table).
 
 A file is bound to the model inputs and to the settings that change what the saved bytes mean. The model fingerprint
 samples (size, first and last MiB) every file the engine loads, by its role: the GGUF shards (also
@@ -1434,8 +1448,12 @@ limits (context and cells, checkpoints, layers, each running-state array, each K
 and then the usual snapshot validation - all before any device write, and a refusal leaves the current session as it
 was. A transfer failure after the device writes began ends the engine (`FATAL`) rather than decode from a partial
 state; the server reports `500` and starts it again. A restore does not park the outgoing session. Not supported with
-`--layer-split`, `--peer-device`, `--batch` (the config's `"parallel"`, #465; the server answers `501`) or
-`--prompt-cache 0` (the RAM conversation cache need not be on). On Linux the file
+`--peer-device`, `--batch` (the config's `"parallel"`, #465; the server answers `501`) or
+`--prompt-cache 0` (the RAM conversation cache need not be on). It works with `--layer-split`: the file records the
+writing runtime's stage table, and the capture, the RAM limits, the validation and the transfer all run per stage,
+each against its own carve; a file written by another split - or by a runtime without one, or for a runtime that
+has one - is refused as invalid before any device write (`saved with a different layer split than this runtime's`).
+On Linux the file
 moves with `O_DIRECT` in 16 MiB blocks when the filesystem takes it (buffered I/O otherwise, or with
 `STRATA_SESSION_BUFFERED=1`); on Windows with buffered I/O. The engine has been run on Linux/CUDA only. An earlier
 revision's CPU file-I/O test passed as a 32-bit Windows executable under Wine; the current code has not been built
@@ -1458,7 +1476,7 @@ more than 16 MiB apart. A symbolic link, a second hard link and a file with one 
 `--rope-freq-base` refused the file and then answered; a save with a RAM floor above the machine's RAM was refused as
 `memory` before any copy, the file it would have replaced untouched. The times are single runs.
 
-**Current limits (v1):** one request at a time unless `"parallel": N` is set (opt-in batch slots, up to N requests
+**Current limits:** one request at a time unless `"parallel": N` is set (opt-in batch slots, up to N requests
 decoded together: [BATCHING.md](BATCHING.md)), and one conversation cached at a time (switching between two chats
 re-reads the other one unless the opt-in cache above is enabled, or each conversation keeps its own batch slot); images only when set up with them (below); no video. **Temperature / top_p / top_k / min_p /
 seed** are honored per request (OpenAI and Anthropic fields), and so are stop strings (OpenAI `stop`, a string or up
