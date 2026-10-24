@@ -121,6 +121,18 @@ bool conversation_session_read_limits_split(SessionReadLimits& limits, const std
 bool conversation_snapshot_validate(const SavedConversation& image, const SessionState& session,
                                     const ModelGeometry& g, const QsaState& draft, std::string& error);
 enum class ConversationRestore { restored, invalid, transfer_failed };
+// The split siblings of validate and restore, for an image read back from a format-v2 session file: the K/V
+// groups are sliced by the stage table / draft_of, every stage is validated over its own carve before anything is
+// transferred (the same validate-then-transfer-once envelope as the single-session functions), and the main stage
+// restores first, mirroring the park loop.  A `draft` of nullptr means no stage owns the draft layer; exactly one
+// stage's group ends with it when a draft exists.
+bool conversation_snapshot_validate_split(const SavedConversation& image, const std::vector<SessionState*>& sessions,
+                                          const std::vector<bool>& draft_of, const QsaState* draft,
+                                          const ModelGeometry& g, std::string& error);
+ConversationRestore conversation_snapshot_restore_split(const SavedConversation& image,
+                                                        const std::vector<SessionState*>& sessions,
+                                                        const std::vector<bool>& draft_of, const QsaState* draft,
+                                                        const ModelGeometry& g, std::string& error);
 // Invalid images are rejected before any CUDA call/write. Transfer failure may
 // leave partial state: caller MUST NOT continue inference from that session.
 ConversationRestore conversation_snapshot_restore(const SavedConversation& image, SessionState& session,
