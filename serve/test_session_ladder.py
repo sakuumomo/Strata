@@ -614,12 +614,15 @@ class LadderConfigFromJson(unittest.TestCase):
         # F6 (final review): a malformed strata.json value ("idle_save_s": "eight") raised a bare ValueError
         # at startup.  The conversions are wrapped: SystemExit names the bad key AND the bad value.
         # Final review C: a JSON boolean is a malformed NUMBER too - `"pre_save_idle_s": false` must not
-        # silently mean 0.0 (fire on any idle moment) through float(False).
+        # silently mean 0.0 (fire on any idle moment) through float(False).  The plain _num keys refused
+        # booleans at the same time: `"idle_save_s": true` meant 1.0 and `"retention_max_files": false`
+        # meant 1, silently re-tuning the ladder behind the reader's back.
         from serve.server import ladder_config_of
         engine = _FakeEngine(["--conversation-cache-mib", "8192"])
         for key, bad in (("idle_save_s", "eight"), ("retention_max_files", "many"),
                          ("pre_save_idle_s", "soon"), ("pre_save_idle_s", False),
-                         ("pre_save_idle_s", True)):
+                         ("pre_save_idle_s", True), ("idle_save_s", True),
+                         ("retention_max_files", False)):
             with self.assertRaises(SystemExit) as cm:
                 ladder_config_of({"session_ladder": {key: bad}}, engine, "/d")
             self.assertIn(key, str(cm.exception))            # names the bad key...

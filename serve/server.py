@@ -923,7 +923,11 @@ def ladder_config_of(cfg: dict, engine, slot_save_path) -> LadderConfig:
     def _num(key, default, cast):
         # F6 (final review): a malformed strata.json value ("idle_save_s": "eight") must not surface as a
         # bare ValueError at startup - the conversion is wrapped and the refusal names the bad key and value.
+        # Same posture as _num_or_none's bool refusal: a JSON boolean is not a number - float(True) would
+        # silently re-tune the ladder (idle_save_s 1.0, retention_max_files 1) behind the reader's back.
         raw = block.get(key, default)
+        if isinstance(raw, bool):
+            raise SystemExit(f'[strata] config "session_ladder" key "{key}" must be a number: {raw!r}')
         try:
             return cast(raw)
         except (TypeError, ValueError):
