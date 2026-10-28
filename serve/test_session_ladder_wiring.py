@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import tempfile
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -158,9 +159,7 @@ class LadderArrival(unittest.TestCase):
         self.ladder.on_arrival(self.service, "ses/../evil", P1)   # the evil id is the active session...
         self.ladder.on_arrival(self.service, "ses-a", P1)         # ...so its save-away builds the filename
         self.assertEqual(self.calls, [("save", str(Path(self.dir.name) / "llm-session-ses_.._evil.bin"))])
-        self.assertEqual([p.name for p in Path(self.dir.name).glob("*")], ["ladder-index.json"])
-        # nothing landed but the ladder's own ledger sidecar (the mock engine wrote no checkpoint file,
-        # and the sanitized name kept the evil id inside the save dir)
+        self.assertEqual(list(Path(self.dir.name).glob("*")), [])  # nothing landed outside the save dir
 
     def test_wiring_refused_class_is_the_server_class_object(self):
         """Eager registration: the ladder excepts the exact class object serve.server exports (module mode
@@ -265,13 +264,8 @@ class LadderHarness(MockEngine):
         self.calls = []
         self.last = None
         self.batch = 0
-        self.session_file = mock.Mock(side_effect=self._session_file)
-
-    def _session_file(self, action, path):
-        self.calls.append((action, path))
-        if action == "save":
-            open(path, "wb").close()      # the save's file, real: the R4 index adoption needs disk to match
-        return {"tokens": 1}
+        self.session_file = mock.Mock(side_effect=lambda action, path: (self.calls.append((action, path)),
+                                                                        {"tokens": 1})[1])
 
 
 def ladder_service(engine, directory):
@@ -315,17 +309,6 @@ class WiringHTTP(unittest.TestCase):
     def actions(self, wanted):
         return [a for a, _ in self.engine.calls if a == wanted]
 
-    def restart(self):
-        # momo's 2026-10-27 14:09 "switch" shape: a new engine and a new server over the same sessions
-        # directory - everything the ladder knew in memory is gone, only the disk is left.
-        self.httpd.shutdown()
-        self.engine = LadderHarness(ByteTokenizer(), "Answer.", max_context=32768)
-        self.svc = ladder_service(self.engine, self.dir.name)
-        self.httpd = serve(self.svc, port=0)
-        self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
-        self.addCleanup(self.httpd.shutdown)
-        self.addCleanup(self.httpd.server_close)
-
     def test_wiring_switch_saves_outgoing_when_lost(self):
         self.post("ses-a", LONG + " first")
         self.post("ses-b", LONG + " second")     # switch: ses-a is a tracked eligible mid whose park was never held
@@ -341,34 +324,6 @@ class WiringHTTP(unittest.TestCase):
         self.post("ses-a", LONG + " first")      # back to ses-a's own conversation: prefix intact
         self.assertEqual(self.actions("restore"), ["restore"])
         self.assertEqual(self.engine.calls[-1], ("restore", str(Path(self.dir.name) / "llm-session-ses-a.bin")))
-
-    def test_wiring_a_restored_session_continues_without_re_restoring(self):
-        # momo 2026-10-27 restore-churn (28 rows): after an engine reload, EVERY arrival of the session
-        # re-issued the RESTORE of the same file while the engine already held the conversation live -
-        # each one truncating the deeper live state back to the file's.  One restore is enough: a
-        # landed restore marks the session resident, and the next arrival continues from the slot.
-        self.post("ses-a", LONG + " first")
-        self.post("ses-b", LONG + " first")               # switch away: ses-a saved to its file
-        self.post("ses-a", LONG + " first")               # switch back: the file is restored (the one)
-        self.post("ses-a", LONG + " first")               # continuation: must NOT restore again
-        self.assertEqual(self.actions("restore"), ["restore"])
-
-    def test_wiring_warm_resume_survives_a_server_restart(self):
-        # R4 (momo 2026-10-27 14:09): the switch restarted the SERVER, the new ladder knew nothing about
-        # the files its own saves had landed, and every session's first turn re-prefilled cold.  The
-        # sessions dir now carries the ladder index: the restarted server adopts the checkpoints, and the
-        # first arrival of a session with a file and a faithful prefix restores warm.  (The last-active
-        # session's load-path handoff through restore_after_load is pinned in the ladder's own unit and
-        # lifecycle tests; this mock engine never reports itself unloaded, so ensure_loaded's load block
-        # is not this file's terrain.)
-        self.post("ses-a", LONG + " first")
-        self.post("ses-b", LONG + " second")             # switch away: ses-a's checkpoint lands
-        self.post("ses-c", LONG + " third")              # and ses-b's; ses-c is the current one
-        self.restart()
-        self.post("ses-a", LONG + " first")              # the deeper conversation, same prompt, new server
-        self.assertEqual([p for a, p in self.engine.calls if a == "restore"],
-                         [str(Path(self.dir.name) / "llm-session-ses-a.bin")])   # adopted from the sidecar: warm
-        self.assertEqual(self.actions("save"), [])       # the adopted sessions are clean on disk: no churn re-save
 
     def test_wiring_restores_a_grown_single_message_session(self):
         # The momo dormancy shape end-to-end (recheck 2026-10-26): a growing single user message re-renders
@@ -419,6 +374,23 @@ class WiringHTTP(unittest.TestCase):
         self.post("ses-b", LONG + " second")     # a real switch would have saved... nothing is called
         self.assertEqual(self.engine.calls, [])
 
+    def test_pre_save_thread_parks_after_a_turn(self):
+        # Task 4's timer thread end-to-end: cfg.pre_save_idle_s = 0.1, start_session_pre_save() running,
+        # one big completed turn, then quiet - the pass parks the session while the engine stays resident
+        # (no unload: the save lands through the ladder's pre-save route, nothing closes the engine).
+        self.svc.session_ladder.cfg.pre_save_idle_s = 0.1
+        self.svc.start_session_pre_save()
+        self.post("ses-a", LONG + " first")
+        path = str(Path(self.dir.name) / "llm-session-ses-a.bin")
+        deadline = time.monotonic() + 12                    # the thread's 2.0 s cadence; the plan's poll cap
+        while time.monotonic() < deadline and ("save", path) not in self.engine.calls:
+            time.sleep(0.25)
+        self.assertIn(("save", path), self.engine.calls)    # the pre-staged checkpoint landed...
+        self.assertEqual(self.actions("save"), ["save"])    # ...exactly one save...
+        self.assertEqual(self.actions("restore"), [])       # ...no restore churn...
+        self.assertTrue(self.svc.loaded())                  # ...the engine was never unloaded...
+        self.assertIn("choices", self.post("ses-a", "ping"))  # ...and still serves the next request
+
     def test_wiring_conv_events_flow_through_metrics(self):
         log = Path(self.dir.name) / "engine.log"
         log.write_text("conversation cache: parked 1234 tokens in 10.0 ms; parked=1 bytes=50000000 evictions=7\n")
@@ -429,6 +401,119 @@ class WiringHTTP(unittest.TestCase):
         self.assertFalse(before)
         self.assertTrue(self.svc.session_ladder.tracked["ses-m"].parked)
         self.assertIn("conversation_cache", view)
+
+
+class PreSavePass(unittest.TestCase):
+    """Task 4: Service.pre_save_pass - one opportunistic non-blocking pass: grab the FIFO (never wait), skip
+    a busy queue and an engine not in memory, survive engine death mid-save, and park the dirty current
+    session when the queue is free and quiet (cfg.pre_save_idle_s = 0 here: the quiet gate is Task 3's, the
+    pass's own gates - FIFO grab, engine state, engine trouble - are what these tests drive).  Fix wave A
+    adds: the in-memory gate also covers a died engine (loaded() False, unloaded False), the ladder's gates
+    answer before the FIFO is touched, and a refused save arms a doubling retry cooldown."""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.engine = LadderHarness(ByteTokenizer(), "Answer.", max_context=32768)
+        self.svc = ladder_service(self.engine, self.dir.name)
+        self.svc.session_ladder.cfg.pre_save_idle_s = 0
+
+    def seen_turn(self, session_id):
+        self.svc.session_ladder.on_arrival(self.svc, session_id, P1)      # the request path's arrival...
+        self.svc.session_ladder.on_turn_done(session_id, MID, 0, 0)       # ...and its DONE figures: a
+        # completed mid turn, tracked, dirty, last_active - the state a real turn leaves the queue in.
+
+    def test_pre_save_pass_skips_a_busy_queue(self):
+        self.seen_turn("ses-a")
+        self.svc.fifo.acquire()                            # a live request (or unload) owns the engine
+        self.addCleanup(self.svc.fifo.release)
+        self.assertFalse(self.svc.pre_save_pass())         # the grab is non-blocking: skip, never wait
+        self.assertEqual(self.engine.calls, [])
+
+    def test_pre_save_pass_skips_an_unstarted_engine(self):
+        self.seen_turn("ses-a")
+        self.engine.unloaded = True                        # the engine flag (server.py:1126/1414): nothing
+        self.assertFalse(self.svc.pre_save_pass())         # in memory to pre-stage
+        self.assertEqual(self.engine.calls, [])
+
+    def test_pre_save_pass_survives_engine_death(self):
+        self.seen_turn("ses-a")
+        self.engine.session_file = mock.Mock(side_effect=EngineDied("engine died mid-save"))
+        self.assertFalse(self.svc.pre_save_pass())         # EngineDied is caught: no exception escapes...
+        self.assertEqual(self.engine.calls, [])            # ...nothing was recorded...
+        self.assertTrue(self.svc.fifo.acquire(blocking=False))  # ...and the FIFO came back clean
+        self.svc.fifo.release()
+
+    def test_pre_save_pass_skips_a_died_engine(self):
+        # Fix wave A (Important 1): a died engine keeps `unloaded` False while Service.loaded() is False
+        # - the gate covers both, so the 2 s loop stops hammering a dead engine.
+        self.seen_turn("ses-a")
+        self.engine.alive = lambda: False                  # died: loaded() is False...
+        self.engine.unloaded = False                       # ...while the resident flag still says "in memory"
+        self.assertFalse(self.svc.pre_save_pass())
+        self.assertEqual(self.engine.calls, [])
+
+    def test_pre_save_pass_grabs_the_fifo_only_when_due(self):
+        # Fix wave A (Recommendation 6): the ladder's quiet gates answer BEFORE the FIFO is touched -
+        # a not-due pass never reaches the grab, and a due pass still grabs it non-blocking.
+        self.svc.session_ladder.cfg.pre_save_idle_s = 20   # pinned quiet gate
+        self.seen_turn("ses-a")
+        self.svc.last_request_at = time.time()             # no quiet at all yet: not due
+        grabs, inner = [], self.svc.fifo
+
+        class Counting:
+            def acquire(self, blocking=True, timeout=-1):
+                grabs.append(blocking)
+                return inner.acquire(blocking, timeout)
+
+            def release(self):
+                return inner.release()
+
+            def __enter__(self):
+                return inner.__enter__()
+
+            def __exit__(self, *exc):
+                return inner.__exit__(*exc)
+
+        self.svc.fifo = Counting()
+        self.addCleanup(setattr, self.svc, "fifo", inner)
+        self.assertFalse(self.svc.pre_save_pass())         # not due...
+        self.assertEqual(grabs, [])                        # ...the FIFO was never grabbed
+        self.assertEqual(self.engine.calls, [])
+        self.svc.session_ladder.cfg.pre_save_idle_s = 0    # due now: the same pass reaches the queue
+        self.assertTrue(self.svc.pre_save_pass())
+        self.assertEqual(grabs, [False])                   # non-blocking grab only, as ever
+        self.assertEqual(self.engine.calls,
+                         [("save", str(Path(self.dir.name) / "llm-session-ses-a.bin"))])
+
+    def test_pre_save_refusal_arms_a_retry_cooldown(self):
+        # Fix wave A (Minor 4), Service side: with a refusing engine and gate 0 the first pass attempts
+        # the save, an immediate second pass issues NO new session_file call (the cooldown holds it),
+        # and a fresh refusal arms again with the recorded delay doubled.  No clock games.
+        self.seen_turn("ses-a")
+        self.engine.session_file = mock.Mock(side_effect=REFUSED_MEMORY)
+        self.assertFalse(self.svc.pre_save_pass())         # the first pass attempts the save...
+        self.assertEqual(self.engine.session_file.call_count, 1)
+        s = self.svc.session_ladder.tracked["ses-a"]
+        self.assertEqual(s.save_retry_delay_s, 5.0)        # ...and arms a 5 s retry cooldown
+        self.assertFalse(self.svc.pre_save_pass())         # an immediate second pass issues no new call...
+        self.assertEqual(self.engine.session_file.call_count, 1)
+        self.svc.session_ladder.on_unload(self.svc)        # a fresh refusal (the unload route) arms it too
+        self.assertEqual(s.save_retry_delay_s, 10.0)       # ...and the recorded delay has doubled
+        self.assertFalse(self.svc.pre_save_pass())
+        self.assertEqual(self.engine.session_file.call_count, 2)   # the pass still stayed out of the engine
+        self.engine.session_file = mock.Mock(side_effect=lambda a, p: (self.engine.calls.append((a, p)),
+                                                                        {"tokens": 1})[1])
+        self.svc.session_ladder.on_unload(self.svc)        # a save commits: the cooldown resets
+        self.assertEqual((s.save_retry_delay_s, s.save_retry_until), (0.0, 0.0))
+        self.svc.session_ladder.on_turn_done("ses-a", MID, 0, 0)   # dirty again...
+        self.assertTrue(self.svc.session_ladder.pre_save_due(0))   # ...and the pass is free to try
+
+    def test_pre_save_pass_parks_the_current_session(self):
+        self.seen_turn("ses-a")                            # completed turn, FIFO free, quiet gate open
+        self.assertTrue(self.svc.pre_save_pass())
+        self.assertEqual(self.engine.calls,
+                         [("save", str(Path(self.dir.name) / "llm-session-ses-a.bin"))])
 
 
 class NearTie(unittest.TestCase):

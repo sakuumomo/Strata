@@ -5,10 +5,9 @@ estimate gap - F1), whether a session should be saved to disk on switch-away (sh
 restored on switch-back (should_restore + prefix_fidelity), which client header names the session
 (extract_session_id)) plus the bookkeeping half (class SessionLadder: per-session TrackedSession state fed by
 the intake - ConvCacheLog.drain_events() events and the request path's DONE figures - and its LRU file
-retention; no imports from server.py; its own filesystem I/O is note_file_saved's removal of an
-over-capacity file plus the R4 ledger sidecar the ladder's saves write and a restarted ladder reads
-(see _write_index/_load_index) - engine save/restore calls go through the caller's
-service.engine, in the F4 lock windows of on_arrival/on_idle/on_unload).
+retention; no imports from server.py; the only filesystem I/O this module performs itself is
+note_file_saved's removal of an over-capacity file - engine save/restore calls go through the caller's
+service.engine, in the F4 lock windows of on_arrival/on_idle/on_unload/pre_save).
 
 Event vocabulary as the engine writes it (ConvCacheLog's lines, parsed upstream into ConvEvent):
 "conversation cache: parked N tokens in T ms; parked=P bytes=B evictions=E ...",
@@ -19,7 +18,6 @@ touching the session), which is what the evictions-pressure signal compares agai
 """
 from __future__ import annotations
 
-import json
 import os
 import re
 import threading
@@ -36,6 +34,13 @@ MIN_PARK_TOKENS = 8192
 
 # Session identity headers, pinned first-wins precedence (OpenCode's native family; serve stamps them).
 SESSION_HEADERS = ("x-session-id", "x-opencode-session-id", "x-session-affinity", "x-opencode-session")
+
+# Pinned refused-save backoff (unload-works final review A): a save the engine refused is not retried on
+# the next 2 s pre-save beat - the refused session arms a retry cooldown that doubles from 5 s per successive
+# refusal up to 300 s, so a session the engine cannot save (out of RAM, out of room) costs the pre-save
+# thread a bounded trickle instead of an attempt every beat.  A save that lands resets it.
+SAVE_RETRY_BASE_S = 5.0
+SAVE_RETRY_CAP_S = 300.0
 
 
 @dataclass
@@ -58,7 +63,8 @@ class TrackedSession:
     joined event (cleared upstream at the session's next switch-away, so should_save is evaluated
     while it still reflects park).  byte_count is this session's half of the (tokens, byte_count)
     join key that join_event matches ConvEvent against - recorded by the intake layer from DONE
-    figures / joined events; it trails the spec's eight fields so every field order stays positional."""
+    figures / joined events; it and the save-duration fields trail the spec's eight fields so every
+    field order stays positional."""
     session_id: str
     tokens: int
     parked: bool
@@ -72,12 +78,15 @@ class TrackedSession:
     # dirties; a save the ladder itself routed (note_file_saved) cleans.  A save made outside the ladder
     # (an image job's, a /v1/slot save) is not visible here: the session stays dirty and the next ladder
     # save rewrites the file - a harmless duplicate, never a missed one (the pinned boundary).
-    resident: bool = False            # momo 2026-10-27 restore-churn finding: the engine's slot still
-    # holds THIS session's live conversation - set by a deep-reused DONE continuation (on_turn_done) or a
-    # landed ladder restore, cleared by the session's switch-away.  A RESTORE over a resident session would
-    # replace the deeper live state with the older file and re-read the difference every turn; resident
-    # beats any restore (evidence: momo-restore-churn-diagnosis-20261027T0900.md, re-reads grew
-    # 2045 -> 6869 -> 12471 tokens turn after turn).
+    last_save_ms: float | None = None # unload-works Task 2: the engine-measured duration of this
+    # session's last landed save (the save result's "ms"; None when never saved or unmeasured)
+    saved_at_bytes: int = 0           # its byte_count at that save moment: the growth reference the
+    # expected_save_seconds estimate scales last_save_ms against
+    save_retry_delay_s: float = 0.0   # final review A: the delay of the retry cooldown the LAST refused
+    # save armed (SAVE_RETRY_BASE_S on the first refusal, doubling per successive refusal to
+    # SAVE_RETRY_CAP_S; 0.0 when nothing is refused or a save landed)
+    save_retry_until: float = 0.0     # time.monotonic() deadline of that cooldown (0.0 = none armed):
+    # pre_save_due answers False while now < until - the engine is not asked again until it expires
 
 
 @dataclass
@@ -87,6 +96,9 @@ class LadderConfig:
     park_budget_mib: int
     idle_save_s: float = 8.0
     retention_max_files: int = 16
+    pre_save_idle_s: float | None = None  # unload-works Task 3: the pre-save quiet gate - None = adaptive
+    # (the queue must be quiet for at least this save's own expected length, expected_save_seconds),
+    # 0 = fire on any idle moment, a number > 0 = pinned seconds of quiet.
 
 
 def extract_session_id(headers: dict) -> str | None:
@@ -132,44 +144,23 @@ def join_event(ev: ConvEvent, tracked: dict) -> TrackedSession | None:
 SNAPSHOT_JOIN_TOLERANCE = 0.15
 JOIN_TOKEN_TOLERANCE = 0.01
 JOIN_TOKEN_TOLERANCE_FLOOR = 256
-# momo 2026-10-27 restore-churn finding: a DONE whose reused is at least this share of its prompt tokens
-# is the engine resuming THIS conversation from its own slot - the session is resident, and a RESTORE
-# of the older file over it would truncate the live state (churn rows 98.6-99.8% vs shallow resumes
-# like 56.8% (x-2 park-checkpoint) and 29.7% (post-cancel rebuild)).  The line sits above both.
-RESIDENT_REUSED_RATIO = 0.9
-# R4 (momo 2026-10-27 battery): the name of the ledger sidecar the ladder's saves write into the sessions
-# dir, so a restarted server re-adopts its checkpoints instead of meeting every session cold.  Distinct
-# from the engine's `llm-session-*` name pattern, and its disappearance is only ever a lost warm resume.
-INDEX_FILE_NAME = "ladder-index.json"
 TOLERANT_JOIN_KINDS = ("parked", "skipped_below_min", "restored")   # the lines whose tokens track a conversation
 # (a `dropped` line names no figures; a tokened `skipped 252953 ...` budget refusal keeps exact-only semantics,
 # as a wrong blame there would record pressure on the wrong mid).
 
 
 def join_event_tolerant(ev: ConvEvent, tracked: dict) -> TrackedSession | None:
-    """The fallback join after join_event's exact key matched nothing.  The TOKEN BAND is the primary
-    gate - every tracked session whose tokens sit within max(JOIN_TOKEN_TOLERANCE x s.tokens,
-    JOIN_TOKEN_TOLERANCE_FLOOR) of the event's is a candidate - and byte proximity is used only to
-    DISAMBIGUATE when the band holds more than one (SNAPSHOT_JOIN_TOLERANCE of the event's byte_count;
-    a tie, or a sizeless byte_count-0 line facing several candidates, joins nothing - the refusal to
-    guess survives tolerance).  Only the kinds listed in TOLERANT_JOIN_KINDS.
-    Why bytes demoted (momo 2026-10-27 battery, probe-A): the DONE side's byte anchor is the pinned
-    40.4 KiB/token estimate while park lines carry the engine's own measured snapshot_bytes - real
-    sizes run 33.6 KiB/token for big sessions and 55-68 KiB/token for small ones, so the two sides
-    miss each other's 15% band on any small mid (probe-A: ~363 MB estimate vs 603430952 measured:
-    a 66% gap) and every join starved, leaving the session parked=False and restore-owed.  Measured
-    vs measured varies more than 15% too (the same probe-A conversation parked at 603430952 and
-    485492400).  A lone in-band candidate mis-joining is benign in this file's own words - it skips a
-    save or defers a restore, and prefix_fidelity still gates every restore."""
+    """The fallback join after join_event's exact key matched nothing: the nearest tracked session whose
+    byte_count is within SNAPSHOT_JOIN_TOLERANCE of the event's byte_count AND whose tokens are within
+    max(JOIN_TOKEN_TOLERANCE x s.tokens, JOIN_TOKEN_TOLERANCE_FLOOR) of the event's.  Only the kinds listed
+    in TOLERANT_JOIN_KINDS; a tie (two candidates at the same gap) joins nothing - the refusal to guess
+    survives tolerance."""
     if ev.kind not in TOLERANT_JOIN_KINDS:
         return None
-    candidates = [s for s in tracked.values()
-                  if abs(ev.tokens - s.tokens) <= max(JOIN_TOKEN_TOLERANCE * s.tokens,
-                                                      JOIN_TOKEN_TOLERANCE_FLOOR)]
-    if len(candidates) == 1:
-        return candidates[0]
     best, best_gap, ties = None, None, 0
-    for s in candidates:
+    for s in tracked.values():
+        if abs(ev.tokens - s.tokens) > max(JOIN_TOKEN_TOLERANCE * s.tokens, JOIN_TOKEN_TOLERANCE_FLOOR):
+            continue
         gap = abs(ev.byte_count - s.byte_count)
         if gap > SNAPSHOT_JOIN_TOLERANCE * ev.byte_count:
             continue
@@ -199,10 +190,9 @@ def should_save(s: TrackedSession, tracked: dict, cfg: LadderConfig) -> bool:
 
 def should_restore(s: TrackedSession, cfg: LadderConfig) -> bool:
     """Restore s on switch-back only when a ladder file exists for it AND park demonstrably missed it
-    AND the engine does not still hold it live (parked is False and resident is False - park hits, and a
-    resident slot, beat any restore).  Ambiguous joins never restore: a missed mid costs
+    (parked is False - park hits beat any restore).  Ambiguous joins never restore: a missed mid costs
     one cold step, a needless restore costs seconds and churns park."""
-    return cfg.enabled and s.file_path is not None and not s.parked and not s.resident
+    return cfg.enabled and s.file_path is not None and not s.parked
 
 
 def prefix_fidelity(saved_prefix: str | None, incoming_prompt: str) -> bool:
@@ -279,7 +269,8 @@ class _locked:
     (join -> park flag; on_turn_done create + anchor) are not atomic on their own, so every wrapped hook
     takes the ladder lock.  A wrapped body therefore calls the plain inner (`_x`), never the locked
     attribute - the lock is not reentrant - and never touches the engine (F4: engine I/O lives in the
-    unlocked windows of on_arrival/on_idle/on_unload, the only public hooks that are not wrapped)."""
+    unlocked windows of on_arrival/on_idle/on_unload/pre_save, the only public hooks that are not
+    wrapped)."""
 
     def __init__(self, fn):
         self.fn = fn
@@ -323,8 +314,6 @@ class SessionLadder:
         # so the retained text can never outrun the 16-file bound (map §6) however many ids churn.
         self._lock = threading.Lock()
         self.last_active: str | None = None             # the session the engine is on right now (Task 7's on_arrival)
-        if self.cfg.enabled and self.cfg.slot_save_path:
-            self._load_index()                          # R4: adopt the ledger a previous server process left
 
     def track(self, session_id: str) -> TrackedSession | None:
         """The session's tracked state, or None when the ladder never saw it (an event never invents one)."""
@@ -395,17 +384,12 @@ class SessionLadder:
             # matter how many ids churn in and out - the least-recently-arrived prompt goes first, and the cap
             # runs after the decision window captured this request's outgoing save prefix in its plan.
             self.last_active = session_id
-        saved_ok = save_plan is not None and self._engine_save(service, save_plan)   # engine I/O: no lock
-        if saved_ok:
+        res = self._engine_save(service, save_plan) if save_plan is not None else None   # engine I/O: no lock
+        if res is not None:
             with self._lock:                         # ledger window: the save landed, record it
-                self._commit_save(save_plan)
+                self._commit_save(save_plan, res)
         if restore_path is not None:
-            landed = self._engine_restore(service, session_id, restore_path)          # engine I/O: no lock
-            if landed:
-                with self._lock:                      # ledger window: the restore put the file's
-                    s = self.tracked.get(session_id)  # conversation into the slot - resident from now
-                    if s is not None:
-                        s.resident = True
+            self._engine_restore(service, session_id, restore_path)                  # engine I/O: no lock
         if switched_from is not None:
             with self._lock:
                 self._note_switch_away(switched_from)   # after should_save saw its park state (Task 7's
@@ -423,82 +407,180 @@ class SessionLadder:
         path = os.path.join(self.cfg.slot_save_path, f"llm-session-{_safe_sid(s.session_id)}.bin")
         return (s.session_id, path, self.last_prompts.get(s.session_id) or s.saved_prefix)
 
-    def _engine_save(self, service, plan) -> bool:
+    def _engine_save(self, service, plan) -> dict | None:
         """ENGINE I/O half of a ladder save (runs OUTSIDE the ladder lock - F4; the FIFO already serializes
-        engine-facing actors): engine.session_file("save", path) for the planned file.  Returns True when
-        the save landed; a SessionRefused is swallowed with the ladder's log line and the ledger records
-        nothing (no phantom file state); an EngineDied propagates (the caller's engine is gone - the request
-        path / unload handles it as it always has)."""
+        engine-facing actors): engine.session_file("save", path) for the planned file.  Returns the engine's
+        result dict (production: {"tokens", "bytes", "ms"}) - handed on to _commit_save for the save-duration
+        bookkeeping - when the save landed; None exactly when refused: a SessionRefused is swallowed with the
+        ladder's log line and the ledger records nothing (no phantom file state); an EngineDied propagates
+        (the caller's engine is gone - the request path / unload handles it as it always has).  A refusal
+        also arms the session's retry cooldown (final review A): the bookkeeping burst takes the lock after
+        the engine call, in F4's ledger window - which is why every save route (switch, idle, unload,
+        pre-save) arms it and only pre_save_due consults it."""
         try:
-            service.engine.session_file("save", plan[1])
-            return True
+            return service.engine.session_file("save", plan[1])
         except _refused_class() as e:
             print(f"[strata] session ladder: the save of {plan[0]} was refused ({e.kind}); "
                   "this conversation continues as a cold prefill", flush=True)
-            return False
+            with self._lock:
+                self._arm_save_refusal(plan[0])
+            return None
 
-    def _commit_save(self, plan) -> None:
+    def _arm_save_refusal(self, session_id: str) -> None:
+        """LEDGER half of a refused save (called holding the LADDER LOCK): the session's retry cooldown -
+        SAVE_RETRY_BASE_S for the first refusal, then doubling per successive refusal, capped at
+        SAVE_RETRY_CAP_S - and its monotonic deadline.  A fresh failure is a fresh failure: the switch and
+        unload routes arm it too, and only the pre-save gate is held back by it (a switch-away save is the
+        request path's own moment and is never deferred).  _commit_save clears what a landed save resets."""
+        s = self.tracked.get(session_id)
+        if s is None:
+            return
+        delay = SAVE_RETRY_BASE_S if s.save_retry_delay_s <= 0 else min(SAVE_RETRY_CAP_S,
+                                                                         s.save_retry_delay_s * 2)
+        s.save_retry_delay_s = delay
+        s.save_retry_until = time.monotonic() + delay
+
+    def _commit_save(self, plan, result: dict | None = None) -> None:
         """LEDGER half of a ladder save (called holding the LADDER LOCK): the landed file becomes the
         session's checkpoint - saved_prefix anchored to the prefix the plan captured, file_path follows it,
         dirty flips clean - and the file joins the LRU ledger via the plain _note_file_saved (retention
-        included).  Split out of the old _save_session by F4 so the engine call sits between lock windows."""
+        included).  The engine result (_engine_save's dict; None from a caller with no result at hand)
+        carries the save-duration bookkeeping: last_save_ms the engine's measured "ms" when reported (a
+        result without the key stays tolerated - the duration is simply unknown), saved_at_bytes this
+        session's tracked byte_count at the save moment - the pair expected_save_seconds scales a future
+        save's estimate from.  A None result records nothing at all (final review A): an absent duration is
+        not a licence to erase the one already on record.  A landed save also clears the refused-save retry
+        cooldown (a save that works has nothing to back off from).  Split out of the old _save_session by
+        F4 so the engine call sits between lock windows."""
         sid, path, prefix = plan
         s = self.tracked.get(sid)
         if s is not None:
             s.saved_prefix = prefix or s.saved_prefix
+            if result is not None:
+                s.last_save_ms = (result or {}).get("ms")
+                s.saved_at_bytes = s.byte_count
+            s.save_retry_delay_s, s.save_retry_until = 0.0, 0.0
         self._note_file_saved(sid, path)
 
-    def _engine_restore(self, service, session_id: str, path: str) -> bool:
+    def expected_save_seconds(self, s: TrackedSession) -> float:
+        """Estimated wall seconds a save of this session would take (unload-works Task 2; Task 3's pre-save
+        quiet gate is derived from it).  With a measured save on record, that measured duration scales by
+        how much the conversation has grown since (a 30 s save of a 1 GB conversation predicts 60 s at
+        2 GB); without one, the engine's ~100 MB/s write rate over the tracked byte_count is the first
+        estimate.  Clamped to [5, 600] s: the floor keeps the estimate meaningful for any conversation,
+        the ceiling bounds it for the biggest ones.  Lock context: it reads the session's fields without
+        taking the lock - holding it around the read is the caller's, per this file's convention
+        (decisions run in a lock window)."""
+        if s.last_save_ms is not None and s.saved_at_bytes:
+            est = s.last_save_ms / 1000 * max(1.0, s.byte_count / max(1, s.saved_at_bytes))
+        else:
+            est = s.byte_count / 1e8
+        return min(600.0, max(5.0, est))
+
+    def _engine_restore(self, service, session_id: str, path: str) -> None:
         """ENGINE I/O of a ladder restore (runs OUTSIDE the ladder lock - F4, same reasoning as
-        _engine_save): engine.session_file("restore", path).  Returns True when it landed; a
-        SessionRefused degrades to a plain prefill with the ladder's log line and answers False, and the
-        file stays in the ledger; an EngineDied propagates."""
+        _engine_save): engine.session_file("restore", path).  A SessionRefused degrades to a plain prefill
+        with the ladder's log line, and the file stays in the ledger; an EngineDied propagates."""
         try:
             service.engine.session_file("restore", path)
-            return True                             # landed: the engine's slot now holds this file's
-            # conversation - the caller records residency so the next arrival continues instead of
-            # restoring the same file again (momo 2026-10-27 churn).
         except _refused_class() as e:
             print(f"[strata] session ladder: the restore of {session_id} was refused "
                   f"({e.kind}); this conversation continues as a cold prefill", flush=True)
-            return False
 
     def on_idle(self, service, idle_seconds: float) -> None:
         """Task 8's idle hook, called while the service FIFO is held (the unload path's hold), with the
         same idle measurement the lazy-unload decision uses (time since last_request_at/started_at).
         idle_seconds >= cfg.idle_save_s is the human-latency head start: before the engine's park is
-        possibly dropped by an idle unload, the last-active session is saved when it is save-eligible
-        and still dirty - unsaved since its last turn (a clean checkpoint already on disk is not
-        rewritten).  Nothing else is saved here: the switch path and on_unload own the other sessions.
-        F4's windows: decide under the ladder lock, engine save outside it, commit the ledger back under it."""
+        possibly dropped by an idle unload, the last-active session is parked - the 2026-10-26 spec's
+        rule (always park the current session): its dirty marker is the ONLY gate, its save-eligibility
+        size never blocks the save (a clean checkpoint already on disk is still not rewritten).  Nothing
+        else is saved here: the switch path and on_unload own the other sessions."""
         if not self.cfg.enabled or idle_seconds < self.cfg.idle_save_s:
             return
+        self._idle_save_current(service)
+
+    def _pre_save_due(self, idle_seconds: float) -> bool:
+        """The one place the pre-save gates live (the plain inner behind the locked `pre_save_due`; it
+        asks the engine nothing).  cfg.enabled; the last-active session exists and is dirty; no refused-save
+        retry cooldown is armed on it (the engine is held off while now < save_retry_until); and the quiet
+        gate cfg.pre_save_idle_s: None = adaptive (quiet must reach THIS session's expected save length,
+        expected_save_seconds - its measured save duration scaled by growth, else the size estimate, 5 s
+        floor), 0 = fire on any idle moment, > 0 = pinned seconds of quiet."""
+        if not self.cfg.enabled:
+            return False
+        s = self.tracked.get(self.last_active) if self.last_active is not None else None
+        if s is None or not s.dirty:
+            return False
+        if time.monotonic() < s.save_retry_until:
+            return False                              # refused recently: wait the cooldown out
+        gate = self.cfg.pre_save_idle_s
+        if gate is None:                              # adaptive: quiet >= this very save's expected length
+            return idle_seconds >= self.expected_save_seconds(s)
+        return gate <= 0 or idle_seconds >= gate      # gate == 0: no quiet requirement
+
+    def pre_save(self, service, idle_seconds: float) -> bool:
+        """Task 3's pre-save hook (2026-10-26 spec §1): save the last-active session once the request
+        queue has been quiet long enough to keep the save out of the way of resumed work.  Task 4's
+        pre_save_pass calls it while the service FIFO is held, with the same idle measurement the
+        lazy-unload decision uses; idle_seconds is the caller's clock value (this hook never sleeps or
+        times).  The gates are `pre_save_due`'s own (the plain inner _pre_save_due, the shared helper -
+        quiet gate cfg.pre_save_idle_s: None adaptive, 0 any idle moment, > 0 pinned seconds): pre_save
+        re-evaluates them in its own decision window, which is what makes the pass's earlier gate read
+        harmless (the state only moves under this same lock).  All gates passing run on_idle's body: the
+        last-active session, dirty is its only gate, a clean checkpoint is not rewritten.  Returns True
+        only when a save committed (final review A: an honest result - every skip and every refused
+        attempt answers False).  F4: the gate decision reads the tracked session under the ladder lock (the
+        same decision window the hooks use); the engine I/O belongs to _idle_save_current's windows; the
+        cfg.enabled gate is checked in the gate helper, as in every public hook."""
+        with self._lock:
+            if not self._pre_save_due(idle_seconds):
+                return False
+        return self._idle_save_current(service)
+
+    def _idle_save_current(self, service) -> bool:
+        """The current (last-active) session's park: decision + engine save + ledger commit, in F4's
+        windows (decide under the ladder lock, session_file outside it, commit the ledger back under it).
+        The last-active session is always save-worthy - dirty is the only gate (2026-10-26 spec: always
+        park the current session, aux-sized conversations included).  The cfg.enabled gate is the
+        caller's responsibility: on_idle, pre_save and on_unload each check it before reaching this
+        body.  Returns True only when a save committed (final review A): a skipped dirty check, a batch-
+        mode plan, and a refused save each answer False.  on_idle's body, and the pre-save hook's route
+        (unload-works Task 3)."""
         with self._lock:
             s = self.tracked.get(self.last_active) if self.last_active is not None else None
-            if s is None or not s.save_eligible or not s.dirty:
-                return
+            if s is None or not s.dirty:
+                return False
             plan = self._plan_save(service, s)
-        if plan is not None and self._engine_save(service, plan):
-            with self._lock:
-                self._commit_save(plan)
+        if plan is None:
+            return False
+        res = self._engine_save(service, plan)
+        if res is None:
+            return False                              # refused: _engine_save armed the retry cooldown
+        with self._lock:
+            self._commit_save(plan, res)
+        return True
 
     def on_unload(self, service) -> None:
         """Task 8's unload hook, called while the FIFO is held, immediately before engine.unload() drops
-        the engine - and with it every parked conversation.  Saves ALL tracked save-eligible sessions
-        (should_save's switch signals are moot: the whole cache is going away), each already-saved-and-
-        unchanged one (dirty False) skipped; an aux-sized session (not eligible) never churns.  A refused
-        save is swallowed and the loop continues: the unload proceeds either way.  F4's windows: all save
-        plans are decided in one lock window, each engine save runs outside the lock, each landed save
-        re-takes the lock for its ledger commit."""
+        the engine - and with it every parked conversation.  Saves every dirty save-eligible session
+        (should_save's switch signals are moot: the whole cache is going away) PLUS the last-active one
+        regardless of size - the 2026-10-26 spec's rule (always park the current session: an aux-sized
+        session at the head of the engine earns its checkpoint too).  Each already-saved-and-unchanged
+        one (dirty False) is skipped, and a NON-current aux keeps the eligibility gate: it never churns.
+        A refused save is swallowed and the loop continues: the unload proceeds either way.  F4's windows:
+        all save plans are decided in one lock window, each engine save runs outside the lock, each landed
+        save re-takes the lock for its ledger commit."""
         if not self.cfg.enabled:
             return
         with self._lock:
             plans = [p for p in (self._plan_save(service, s) for s in list(self.tracked.values())
-                                 if s.save_eligible and s.dirty) if p is not None]
+                                 if s.dirty and (s.save_eligible or self.last_active == s.session_id))
+                     if p is not None]
         for plan in plans:
-            if self._engine_save(service, plan):
+            res = self._engine_save(service, plan)
+            if res is not None:
                 with self._lock:
-                    self._commit_save(plan)
+                    self._commit_save(plan, res)
 
     def _on_start(self, service) -> None:
         """Task 8's engine-start hook, called from ensure_loaded (the FIFO held, the engine just reached
@@ -516,9 +598,6 @@ class SessionLadder:
             return
         for s in self.tracked.values():
             s.parked = False
-            s.resident = False                      # a fresh engine holds nothing either: residency
-            # claims from the previous engine die with it (the warm handoff below re-earns it, from
-            # its own restore, for exactly the one session it hands over)
         if getattr(service, "restore_after_load", None):
             return                                    # a pending restore owns this start: yield to it
         s = self.tracked.get(self.last_active) if self.last_active is not None else None
@@ -528,8 +607,6 @@ class SessionLadder:
         if path in self.saved_files:
             self.saved_files.remove(path)             # consumed by the restore below (it unlinks it)
         service.restore_after_load = path
-        self._write_index()                           # R4: the consumed checkpoint leaves the sidecar too -
-        # nothing re-adopts a file the load path is about to unlink
 
     def record_saved_prefix(self, session_id: str, prompt: str) -> None:
         """Task 7 re-anchors a checkpoint's prefix to the conversation as it now renders (the prompt text
@@ -549,25 +626,16 @@ class SessionLadder:
         """One drained engine event.  Joined by join_event's (tokens, byte_count) - except a
         skipped_over_budget line that names only a snapshot MiB, which joins the nearest estimated session
         (SNAPSHOT_JOIN_TOLERANCE above), and except that when the exact key matches nothing a
-        parked/skipped_below_min/restored line joins on the tolerant join's token band, bytes disambiguating
-        only a crowded band (join_event_tolerant, F1 + the 2026-10-27 battery: a DONE-estimate and a park
-        line's measured snapshot_bytes miss each other's byte band on any small mid - 33.6 to 68 KiB/token
-        in the fleet - while their tokens stay within 1%).  Every join records the engine's running
-        evictions counter
-        into that session's baseline, re-anchors the session's token and byte figures to the event's
-        (the engine's own - measured whenever the line names snapshot_bytes), and sets the session's own
-        park state: a `parked` event parks it.  An unjoinable (or ambiguous) event records nothing: the
-        engine's fingerprint validation is the backstop."""
+        parked/skipped_below_min/restored line joins the nearest session within the pinned tolerances
+        (join_event_tolerant, F1: the request path's DONE-estimate bytes and a park line's snapshot bytes
+        are 3% apart on the same conversation).  Every join records the engine's running evictions counter
+        into that session's baseline, and the join sets the session's own park state: a `parked` event parks
+        it.  An unjoinable (or ambiguous) event records nothing: the engine's fingerprint validation is the
+        backstop."""
         s = self._join(ev)
         if s is None:
             return
         s.evictions_at_last_switch = ev.evictions
-        if ev.tokens > 0:
-            s.tokens = ev.tokens                            # the join re-anchors the session to the
-        if ev.byte_count > 0:
-            s.byte_count = ev.byte_count                    # engine's own figures (measured whenever
-        # the line names snapshot_bytes): from the first landed join on, joins compare measured to
-        # measured instead of the pinned estimate against the engine's real sizes (probe-A battery).
         if ev.kind == "parked":
             s.parked = True
 
@@ -591,11 +659,6 @@ class SessionLadder:
         s.save_eligible = over_budget or tokens >= MIN_PARK_TOKENS
         s.dirty = True                                # Task 8: a completed turn is unsaved until the
         # ladder's next save of it (on_idle / on_unload / a switch-away save)
-        s.resident = s.resident or reused >= RESIDENT_REUSED_RATIO * s.tokens   # the slot holds THIS
-        # conversation: a deep-reused DONE is the engine continuing from its own live/park state (momo
-        # residency line above).  One-way grant: only the session's switch-away (_note_switch_away) and
-        # an engine restart (on_start) can make residency false again - a shallow DONE cannot mean the
-        # slot lost the conversation, because those two events are exactly what loses it.
         if reused == 0 and s.parked and s.file_path is not None:
             s.parked = False                          # park self-heal (the momo dormancy, recheck 2026-10-26):
         # DONE's reused is the engine's only session-attributed cache accounting - a park copy that held this
@@ -604,8 +667,13 @@ class SessionLadder:
         # joined parked=True forever and every switch-back silently pays the cold prefill.  The design floor's
         # one cold step is already paid by this turn; unparking lets the next switch-back reach should_restore's
         # file+fidelity gates (an aux without a file cannot restore anyway and is left untouched).
-        if not s.save_eligible:
-            self.last_prompts.pop(session_id, None)  # an aux-sized conversation earns no saves: no retained prefix
+        if not s.save_eligible and session_id != self.last_active:
+            self.last_prompts.pop(session_id, None)  # an aux-sized conversation earns no saves: no retained
+        # prefix - EXCEPT the current one (Task 1 review carry-over): the last-active session is saved on
+        # idle/unload regardless of eligibility (always park the current session), and its save records
+        # this prompt as the checkpoint's prefix - the value _on_start's warm handoff gate and a later
+        # prefix_fidelity compare against.  Popping a CURRENT aux's prompt would strand its checkpoint
+        # with saved_prefix None and the warm restore would skip it (test_aux_current_checkpoint_warms_the_next_start).
 
     def _note_switch_away(self, session_id: str) -> None:
         """The session's switch-away (Task 7 calls it after should_save was evaluated, which is why should_save
@@ -614,15 +682,15 @@ class SessionLadder:
         s = self.tracked.get(session_id)
         if s is not None:
             s.parked = False
-            s.resident = False                      # residency dies with the switch: from here the
-            # engine keeps or loses the conversation, and a later switch-back may owe it a restore.
 
     def _note_file_saved(self, session_id: str, path: str) -> None:
         """Task 7 records a ladder file it saved for this session: the file joins the LRU ledger (a re-save of
         the same path moves it to the recent end - saves overwrite in place), the session's file_path follows
-        it, and the ledger caps at cfg.retention_max_files: an over-cap save retires the least-recent file -
-        removed from disk (one canonical file per session; the cap is what bounds the big ones, the tmpfiles
-        age rule owns the rest) together with that session's tracked state."""
+        it, and the ledger caps at cfg.retention_max_files: an over-cap save retires a file - removed from
+        disk (one canonical file per session; the cap is what bounds the big ones, the tmpfiles age rule owns
+        the rest) together with that session's tracked state.  Which file is the _retirement_victim's
+        decision (final review B): aux-first, plain LRU as the fallback.  The cap itself is enforced either
+        way."""
         if path in self.saved_files:
             self.saved_files.remove(path)
         self.saved_files.append(path)
@@ -631,7 +699,8 @@ class SessionLadder:
             s.file_path = path
             s.dirty = False                           # Task 8: the ladder's own save makes it clean
         while len(self.saved_files) > self.cfg.retention_max_files:
-            old = self.saved_files.pop(0)
+            old = self._retirement_victim()
+            self.saved_files.remove(old)
             for sid in [k for k, v in self.tracked.items() if v.file_path == old]:
                 del self.tracked[sid]
                 self.last_prompts.pop(sid, None)               # the prefix bound to a retired file retires with it
@@ -639,76 +708,21 @@ class SessionLadder:
                 os.remove(old)
             except OSError:
                 pass                                       # already gone (the age rule got there first): the ledger is what matters
-        self._write_index()       # R4: this save's file facts (entry, move, retirement) into the sidecar
 
-    def _index_path(self) -> str:
-        return os.path.join(self.cfg.slot_save_path, INDEX_FILE_NAME)
-
-    def _write_index(self) -> None:
-        """R4 (momo 2026-10-27 battery): the ledger - the file list in LRU order, and each file's session
-        with the save-time prefix and token anchor - survives the server process through a sidecar JSON in
-        the sessions dir.  Written on the ledger's FILE moments only: a save (with or without a retirement),
-        and the warm handoff's consumption - never per turn: record_saved_prefix's advance stays in memory,
-        so a persisted prefix always pairs with the file it was saved against (the same conservatism F8
-        states for the re-anchor; a restart between saves re-anchors from the file's own conversation).
-        saved_files order IS the LRU record (last item = last saved); entries sit on top of the files -
-        a ledger path whose tracked session is gone rides on with no entry, exactly as in memory.
-        Atomic (tmp + os.replace); a sidecar that cannot be written costs only the next restart's warm
-        resume - the in-memory ledger and the next save are untouched."""
-        entries = {}
-        for path in self.saved_files:
-            for sid, s in self.tracked.items():
-                if s.file_path == path:
-                    entries[sid] = {"file": path, "tokens": s.tokens,
-                                    "saved_prefix": s.saved_prefix or ""}
-        try:
-            tmp = self._index_path() + ".tmp"
-            with open(tmp, "w") as f:
-                json.dump({"version": 1, "files": list(self.saved_files), "entries": entries}, f)
-            os.replace(tmp, self._index_path())
-        except OSError:
-            pass                                        # an unwritable dir degrades to no-sidecar behavior
-
-    def _load_index(self) -> None:
-        """R4's adoption at ladder start: rebuild the ledger from the sidecar.  A file the tmpfiles age rule
-        already removed is not adopted (and leaves the ledger - it is gone); a missing or corrupt sidecar is
-        no ledger at all - today's cold behavior, never a crash.  An adopted session IS its saved state:
-        clean (no instant re-save), unparked and non-resident (a fresh engine parks and holds nothing),
-        save_eligible from its tokens (the same shape on_turn_done computes), its prefix as the save paired
-        them.  last_active adopts the owner of the LAST saved file - exactly _on_start's warm-handoff
-        candidate.  File-system reads run in the constructor, before the ladder is shared."""
-        try:
-            with open(self._index_path()) as f:
-                data = json.load(f)
-        except (OSError, ValueError):
-            return
-        if not isinstance(data, dict):
-            return
-        files = [p for p in data.get("files", []) if isinstance(p, str) and os.path.exists(p)]
-        self.saved_files = files
-        entries = data.get("entries")
-        if not isinstance(entries, dict):
-            entries = {}
-        for sid, e in entries.items():
-            if not isinstance(sid, str) or not isinstance(e, dict):
-                continue
-            path, tokens = e.get("file"), e.get("tokens")
-            if path not in files or isinstance(tokens, bool) or not isinstance(tokens, int) or tokens < 0:
-                continue
-            prefix = e.get("saved_prefix")
-            self.tracked[sid] = TrackedSession(
-                session_id=sid, tokens=tokens, parked=False,
-                save_eligible=(tokens * PARK_COST_KIB_PER_TOKEN / 1024.0 > self.cfg.park_budget_mib
-                               or tokens >= MIN_PARK_TOKENS),
-                file_path=path, saved_prefix=prefix if isinstance(prefix, str) and prefix else None,
-                last_active=0.0, evictions_at_last_switch=0, dirty=False,
-                byte_count=int(tokens * PARK_COST_KIB_PER_TOKEN * 1024))   # the same normalization an
-            # on_turn_done intake gives: the estimate stands in until a joined event re-anchors to measured
-        for path in reversed(files):
-            owner = next((sid for sid, s in self.tracked.items() if s.file_path == path), None)
-            if owner is not None:
-                self.last_active = owner
-                break
+    def _retirement_victim(self) -> str:
+        """Which file an over-cap save retires (final review B).  Plain least-recent is wrong under the
+        always-park-current rule: an aux-sized CURRENT session earns a checkpoint too, so a 100-token park
+        could evict an older mid - the expensive file, the one whose restore was worth seconds.  So the
+        victim is the LEAST-RECENT entry whose tracked session is not save_eligible (aux-sized: the cheap
+        re-prefill), and a ledger path whose tracked session is already gone counts as a candidate - there
+        is nothing left behind it to protect.  Only when no such entry exists does retirement fall back to
+        the plain least-recent file.  The hard cap is unchanged either way: exactly one file goes per
+        over-cap save (this is called holding the LADDER LOCK, from _note_file_saved)."""
+        for path in self.saved_files:                        # least-recent first
+            owners = [sid for sid, v in self.tracked.items() if v.file_path == path]
+            if not owners or all(not self.tracked[sid].save_eligible for sid in owners):
+                return path
+        return self.saved_files[0]
 
     def _join(self, ev: ConvEvent) -> TrackedSession | None:
         if ev.kind == "skipped_over_budget" and ev.tokens == 0:
@@ -727,18 +741,21 @@ class SessionLadder:
 
     # Every public hook that only touches ladder state runs holding the ladder lock via _locked (see the
     # wrapper): on_conv_event/on_turn_done arrive from the metrics() drain, record_saved_prefix from a
-    # FIFO-serialized request thread; track stays unlocked (a single dict read) so a caller holding nothing
-    # else can peek without serializing behind a save.  on_arrival/on_idle/on_unload are NOT wrapped (F4,
-    # final review): they take the lock themselves in short windows around their decisions and ledger
-    # commits and run the engine.session_file calls between the windows, lock-free - the single-lock-point
-    # pattern survives as "a wrapped body never takes the lock and never touches the engine": these three
-    # are plain methods managing their own windows, and every state mutation inside a window goes through
-    # the plain inners (_note_switch_away, _note_file_saved, _plan_save, _commit_save), never a _locked
-    # attribute, because the lock is not reentrant.  on_start stays wrapped: it only queues
-    # restore_after_load - it issues no engine I/O of its own.
+    # FIFO-serialized request thread, pre_save_due is the engine-free pre-save gate Service.pre_save_pass
+    # asks before it touches the FIFO.  track stays unlocked (a single dict read) so a caller holding nothing
+    # else can peek without serializing behind a save.  on_arrival/on_idle/on_unload/pre_save are NOT
+    # wrapped (F4, final review): they take the lock themselves in short windows around their decisions
+    # and ledger commits and run the engine.session_file calls between the windows, lock-free (pre_save
+    # adds only its gate decision window; its engine I/O is _idle_save_current's windows) - the
+    # single-lock-point pattern survives as "a wrapped body never takes the lock and never touches the
+    # engine": these four are plain methods managing their own windows, and every state mutation inside a
+    # window goes through the plain inners (_note_switch_away, _note_file_saved, _plan_save, _commit_save,
+    # _arm_save_refusal, _pre_save_due), never a _locked attribute, because the lock is not reentrant.
+    # on_start stays wrapped: it only queues restore_after_load - it issues no engine I/O of its own.
     on_conv_event = _locked(_on_conv_event)
     on_turn_done = _locked(_on_turn_done)
     note_switch_away = _locked(_note_switch_away)
     note_file_saved = _locked(_note_file_saved)
     record_saved_prefix = _locked(record_saved_prefix)
     on_start = _locked(_on_start)
+    pre_save_due = _locked(_pre_save_due)
